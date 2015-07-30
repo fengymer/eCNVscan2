@@ -1,0 +1,880 @@
+#!/usr/bin/ruby
+#
+#
+$: << File.join(File.dirname(File.dirname($0)), "lib")
+require 'rubygems'
+require 'mysql'
+require 'myapp'
+require 'optparse'
+
+def read_exp_file(exp_file, bed="null")
+  out = {}
+  header = FALSE
+  matched = 0
+  keys = []
+  puts "Accessing: #{exp_file}"
+  f = File.open(exp_file,"r")
+  while (line = f.gets)
+    next if line.empty?
+    next if /Software|Project|Date|Instrument|Applcation|Total Reads/.match(line)
+    if /Matched Reads/.match(line)
+      tmp = line.chomp.split(/\t/)
+      matched = tmp[1].to_i
+    end
+    next if /^$/.match(line)
+    if header == TRUE
+      tmp = line.chomp.split(/\t/)
+      gene = tmp[keys.index("Gene")].split(/;/)[0]
+      if /chrX-/.match(gene) || /noReport-/.match(gene)
+        gene = gene.split("-")[1]
+      end
+      if bed == "null"
+        name = ""
+        if gene == "C9orf66"
+          name = "#{tmp[keys.index("Index")]}:DOCK8"
+        elsif gene == "ZSWIM7"
+          name = "#{tmp[keys.index("Index")]}:TTC19"
+        elsif gene == "INS-IGN2"
+          name = "#{tmp[keys.index("Index")]}:INS"
+        else
+          name = "#{tmp[keys.index("Index")]}:#{gene}"
+        end
+      else
+        ch_start = tmp[keys.index("Chr Position Start")].to_i
+        ch_end = tmp[keys.index("Chr Position End")].to_i
+        
+        bed_tmp = parse_bed_file(bed)
+        gene_id = get_gene_id_from_nm_mysql(find_NM_chr_from_bed(ch_start, ch_end, bed_tmp))
+        name = "#{tmp[keys.index("Index")]}:#{gene_id}"
+      end
+      avg_counts = tmp[keys.index("Average Counts")].to_f
+      read_counts = tmp[keys.index("Read Counts")].to_f
+      norm = avg_counts / matched
+      out[name] ="#{avg_counts};#{norm};#{read_counts}"
+    end
+    if /Index/.match(line)
+      header = TRUE
+      keys = line.chomp.split(/\t/)
+    end
+  end
+  return out
+end
+
+def find_NM_chr_from_bed(ch_st, ch_en, bed)
+  bed.each do |k,v|
+    tmp = k.split(/:/)
+    chr = tmp[0]
+    k_st = tmp[1].to_i + 1
+    k_en = tmp[2].to_i + 1
+    if k_st <= ch_st && k_en >= ch_en
+      tmp_v = v.split(/_/)
+      return "NM_#{tmp_v[1]}:#{chr}"
+    end
+  end
+  return "NMNotFound"
+end
+
+def get_gene_id_from_nm_mysql(nm_chr)
+  user = "mito"
+  pw = user
+  strand = "o"
+  rs = []
+  nm = nm_chr.split(/:/)[0]
+  chr = nm_chr.split(/:/)[1]
+  begin
+    con = Mysql.new 'localhost', user, pw, 'nuclear_genes'
+    rs_query = con.query("select gene_id from gene_info where chr='#{chr}' and nm like '#{nm}%'")
+    if rs_query.num_rows < 1
+      puts "Error: no gene_id were returned from gene_info with NM: #{nm}"
+    elsif rs_query.num_rows > 1
+      puts "Warning: more than one gene is found for #{nm_chr}"
+    end
+    rs = []
+    rs_query.num_rows.times do
+      rs <<  rs_query.fetch_row
+    end
+    rescue Mysql::Error => e
+      puts e.errno
+      puts e.error
+    ensure
+      con.close if con
+  end
+  return rs[0]
+end
+
+def parse_bed_file(file)
+  out = {}
+  f = File.open(file,"r")
+  while (line = f.gets)
+    tmp = line.chomp.split(/\t/)
+    chr = tmp[0].split(/chr/)[1]
+    key = "#{chr}:#{tmp[1]}:#{tmp[2]}"
+    out[key] = tmp[3]
+  end
+  return out
+end
+
+def exp_to_config(file, bed="null")
+  out = {}
+  f = File.open(file, "r")
+  header = FALSE
+  keys = []
+  while (line = f.gets)
+    next if line.empty?
+    next if /Software|Project|Date|Instrument|Applcation|Total Reads/.match(line)
+    if header == TRUE
+      data = []
+      tmp = line.chomp.split(/\t/)
+      ind = tmp[keys.index("Index")]
+      chr = tmp[keys.index("Chr")]
+      if !/chr/.match(chr)
+        chr = "chr" + chr
+      end
+      data << chr
+      ch_start = tmp[keys.index("Chr Position Start")].to_i
+      ch_end = tmp[keys.index("Chr Position End")].to_i
+      data << ch_start
+      data << ch_end
+      gene_tmp = tmp[keys.index("Gene")].split(";")
+      gene = gene_tmp[0]
+      if gene == "C9orf66"
+        gene = "DOCK8"
+      elsif /chrX-/.match(gene) || /noReport-/.match(gene)
+        gene = gene.split("-")[1]
+      elsif /INS-IGF2/.match(gene)
+        gene = "INS"
+      elsif gene == "ZSWIM7"
+        gene = "TTC19"
+      end
+      if bed != "null"
+        bed_tmp = parse_bed_file(bed)
+        gene_id = get_gene_id_from_nm_mysql(find_NM_chr_from_bed(ch_start, ch_end, bed_tmp))
+        name = "#{tmp[keys.index("Index")]}:#{gene_id}"
+      end
+      exon = ""
+      if gene == "RMRP"  #RMRP exception
+        exon = "1"
+      else      
+        exon = check_exon_mysql(gene,ch_start, ch_end)
+      end
+      data << "#{gene}-EX_#{exon}"
+      out[ind] = data
+    end
+    if /Index/.match(line)
+      header = TRUE
+      keys = line.split(/\t/)
+      if !keys.include?("Chr")
+        puts "exp does not include chr"
+        return out
+      end
+    end
+  end
+  return out
+end
+
+def check_exon_mysql(gene, gene_start, gene_end)
+  user = "mito"
+  pw = user
+  strand = "o"
+  rs = []
+  begin
+    con = Mysql.new 'localhost', user, pw, 'nuclear_genes'
+    rs_query = con.query("select exon_num, start_coord_hg19, end_coord_hg19 from exon_coord where gene_id='#{gene}'")
+    if rs_query.num_rows < 1
+      puts "Error: nothing was returned from #{gene} query from exon_coord"
+    end
+    rs = []
+    rs_query.num_rows.times do 
+      rs <<  rs_query.fetch_row
+    end
+    strand_query= con.query("select strand from gene_info where gene_id='#{gene}'")
+    if strand_query.num_rows < 1
+      puts "Error: #{gene} could not be found in mysql db"
+    end
+    strand = strand_query.fetch_row[0]
+    rescue Mysql::Error => e
+      puts e.errno
+      puts e.error
+    ensure
+      con.close if con
+  end
+  rs.each do |x|
+    ch_en = x[2].to_i
+    ch_st = x[1].to_i
+    if strand =="-"
+      ch_en = x[1].to_i
+      ch_st = x[2].to_i
+    end
+    if ch_en < gene_end && ch_en > gene_start && 
+      (ch_st > gene_start || ch_st < gene_start) 
+      return x[0]
+    elsif ch_en > gene_end && ch_st > gene_start && ch_st < gene_end
+      return x[0]
+    else
+      next
+    end
+  end
+  return "iso"
+end
+
+def load_config_file(file)
+  out = {}
+  f = File.open(file, "r")
+  header = FALSE
+  while (line = f.gets)
+    next if line.empty?
+    next if /Software|Project|Date|Instrument|Applcation|Total Reads/.match(line)
+    
+    if /Index/.match(line)
+      header = TRUE
+      next
+    end
+    if header == TRUE
+      data = []
+      tmp = line.chomp.split(/\t/)
+      ind = tmp[0]
+      chr = tmp[1]
+      if !/chr/.match(chr)
+        chr = "chr" + chr 
+      end
+      data << chr
+      data << tmp[2]
+      data << tmp[3]
+      data << "#{tmp[4]}CDS-#{tmp[5]}".gsub(/\s+/,"")
+      out[ind] = data
+    end
+  end
+  return out
+end
+
+def batch_num_conversion(num)
+  if num < 10
+    return "00#{num}"
+  elsif num < 100
+    return "0#{num}"
+  end
+  return "#{num}"
+end
+
+def find_average(data_hash, row)
+  norm_arr = []
+  data_hash.each do |k,v|
+    norm = v[row].split(/;/)[1].to_f
+    norm_arr << norm
+  end
+  avg = MyApp::mean(norm_arr) 
+  return avg
+end
+
+def find_std(data_hash,row)
+  norm_arr = []
+  data_hash.each do |k,v|
+    norm = v[row].split(/;/)[1].to_f
+    norm_arr << norm
+  end
+  std = MyApp::standard_deviation(norm_arr)
+  return std
+end
+
+def find_file_dir(list, file)
+  list.each do |x|
+    if /#{file}/.match(x)
+      return File.dirname(x)
+    end
+  end
+  return "Full path not found"
+end
+
+def find_bed_file(panel)
+  files = []
+  Dir["/mgl_mito/NGS\ configuration\ files/*#{panel}-*/#{panel}*-HG19*.bed"].select do |e|
+    files << e
+  end
+  if files.size > 1
+    text = "Multiple Bed files found:\n"
+    files.each do |e|
+      text = text = "#{e}\n"
+    end
+    puts text
+    exit(1)
+  elsif files.size == 1
+    bed = files.pop
+    puts "bed file: #{bed}"
+    return bed
+  else
+    return "Bed file not found for panel: #{panel}"
+  end
+end
+
+def create_ucsc_custom_track(config, panel_name, final_results, outfile)
+  f = File.open(outfile,"w")
+  f.puts config_track(panel_name)
+  for i in 1..config.size
+    f.puts config[i.to_s].join("\t")
+  end
+
+  cnv = get_std_data(config, final_results)
+  f.puts ""
+  f.puts cnv_track()
+  for i in 1..config.size
+    f.puts config[i.to_s][0..2].join("\t") + "\t#{cnv[i.to_s]}"
+  end
+
+  final_results.each do |k,v|
+    f.puts ""
+    tmp_k = k.split("/")
+    tmp = tmp_k[-1].split("-all-data")[0]
+    f.puts ind_track(tmp)
+    for i in 1..config.size
+      string = config[i.to_s][0..2].join("\t")
+      tmp = v[i.to_s].split(";")[3]
+      string = string + "\t#{tmp}"
+      f.puts string
+    end
+  end
+  f.close
+end
+
+def get_std_data(config, final_results)
+  out = {}
+  for i in 1..config.size
+    array = []
+    final_results.each do |k,v|
+      tmp = v["#{i}"].split(";")
+      array << tmp[3].to_i
+    end
+    out["#{i}"] = MyApp::standard_deviation(array)/MyApp::mean(array)
+  end
+  return out
+end
+
+def config_track(name)
+  return "track  name=#{name} description=\"#{name}\"  visiblity=pack color=0,102,0"
+end
+
+def ind_track(name)
+  string = "track type=bedGraph  type=bedGraph  name=#{name} " +
+          "description=\"#{name}\" alwaysZero=on visibility=full " +
+          "yLineMark=2 yLineOnOff=on gridDefault=on autoScale=off " +
+          " viewLimits=0:4"
+  return string
+end
+
+def cnv_track()
+  return "track type=bedGraph  name=CNV-variation " +
+         "description=\"CNV-variation\" alwaysZero=on " +
+         "visibility=full  maxHeightPixels=64 autoScale=on " +
+         "color=255,0,0  viewLimits=0:2"
+end
+
+def create_ind_data(final_results, refs)
+  final_results.each do |k,v|
+    path = File.dirname(k)
+    fname = k.split("/")[-1].split(/[_|-]all-data_Expression_Report/)[0] 
+    f = File.open("#{path}/#{fname}_CNV_data.txt","w")
+    f.puts "Index\tName\tAverage Reads\tNormalized\tReference\tNorm/Ref\tcorrection\tStandard Deviation\tCV\tCNV Call"
+    for i in 1..v.keys.size
+      tmp = v["#{i.to_s}"].split(/;/)
+      ref_key = tmp[0]
+      cnv = check_cnv(tmp[4].to_f, refs[ref_key][1].to_f)
+      cv = refs[ref_key][1].to_f/refs[ref_key][0].to_f
+      f.puts "#{i}\t#{tmp[0]}\t#{tmp[1]}\t#{tmp[2]}\t#{refs[ref_key][0]}\t#{tmp[4]}\t#{tmp[3]}\t#{refs[ref_key][1]}\t#{cv}\t#{cnv}"
+    end
+    f.close
+  end
+end
+
+def check_cnv(norm_ref,sigma)
+  if sigma >= 0.5
+    return "highCV"
+  else
+    if norm_ref < 0.7 && norm_ref < (1-1.5*sigma)
+      return "del"
+    elsif norm_ref >= 1.35 && norm_ref > (1+1.5*sigma)
+      return "ins"
+    else
+      return "-"
+    end
+  end
+end
+
+def get_ind_name(file)
+  tmp = File.basename(file)
+  name = tmp.split("-all-data")[0]
+  return name
+end
+
+def get_name(file)
+  tmp = file.split("/")
+  batch = tmp[-6]
+  panel = tmp[-5]
+  return "#{batch}-#{panel}"
+end
+
+def out_drs_file(final_results, outfile)
+  f = File.open(outfile,"w")
+  f.puts "File\tDRS"
+  final_results.each do |k,v|
+    name = get_ind_name(k)
+    nums = []
+    v.each do |key,val|
+      tmp = val.split(";")
+      nums << tmp[3]
+    end
+    drs = calculate_drs(nums)
+    f.puts "#{name}\t#{drs}"
+  end
+  f.close
+end
+
+
+def out_cnv_coords_config(coord_out, final_results, config, example_path)
+  f = File.open(coord_out,"w")
+  out = "Index\tGene"
+  final_results.keys.each do |k|
+    out = out + "\t#{get_ind_name(k)}"
+  end
+  f.puts out
+  for i in 1.. final_results[example_path].size
+    tmp_name = final_results[example_path]
+    name = tmp_name["#{i}"].split(";")[0]
+    text = "#{i}\t#{config["#{i.to_s}"][3]}"
+    final_results.each do |k,v|
+      tmp = v["#{i}"].split(";")
+      text = text + "\t#{tmp[3]}"
+    end
+    f.puts text
+  end
+  f.close
+end
+
+def out_cnv_coords_avgcounts(coord_out, final_results, config, example_path)
+  f = File.open(coord_out,"w")
+  out = "Index\tGene"
+  final_results.keys.each do |k|
+    out = out + "\t#{get_ind_name(k)}"
+  end
+  f.puts out
+  for i in 1.. final_results[example_path].size
+    tmp_name = final_results[example_path]
+    name = tmp_name["#{i}"].split(";")[0]
+    text = "#{i}\t#{config["#{i.to_s}"][3]}"
+    final_results.each do |k,v|
+      tmp = v["#{i}"].split(";")
+      text = text + "\t#{tmp[1]}"
+    end
+    f.puts text
+  end
+  f.close
+end
+
+def out_cnv_coords_readcounts(coord_out, final_results, config, example_path)
+  f = File.open(coord_out,"w")
+  out = "Index\tGene"
+  final_results.keys.each do |k|
+    out = out + "\t#{get_ind_name(k)}"
+  end
+  f.puts out
+  for i in 1.. final_results[example_path].size
+    tmp_name = final_results[example_path]
+    name = tmp_name["#{i}"].split(";")[0]
+    text = "#{i}\t#{config["#{i.to_s}"][3]}"
+    final_results.each do |k,v|
+      tmp = v["#{i}"].split(";")
+      text = text + "\t#{tmp[5]}"
+    end
+    f.puts text
+  end
+  f.close
+end
+
+def out_cnv_coords(coord_out, final_results, config, example_path)
+  f = File.open(coord_out, "w")
+  out = "Index\tGene"
+  final_results.keys.each do |k|
+    tmp_k = k.split("/")
+    tmp = tmp_k[-1].split("all-data")[0]
+    out = out + "\t#{tmp}"
+  end
+  f.puts out
+  for i in 1.. final_results[example_path].size
+    tmp_name = final_results[example_path]
+    name = tmp_name["#{i}"].split(";")[0]
+    text = "#{i}\t#{config["#{i.to_s}"][3]}"
+    final_results.each do |k,v|
+      tmp = v["#{i}"].split(";")
+      text = text + "\t#{tmp[3]}"
+    end
+    f.puts text
+  end
+  f.close
+end
+
+def out_check_files(path, list, out_tag)
+  if list.empty?
+    puts "#{out_tag} check file has no data"
+    exit
+  end
+  files = Dir["#{path}/*CNV_data.txt"]
+  list.each do |test,v|
+    files.each do |k|
+      path = File.dirname(k)
+      fname = k.split("/")[-1].split(/.txt/)[0]
+      test_code = fname.split("-")[1]
+      next if test_code != test
+      f = File.open("#{path}/#{fname}_#{out_tag}-check.txt","w")
+      cnv = File.open(k,"r")
+      while (line = cnv.gets)
+        if /Index/.match(line)
+          f.puts(line.chomp)
+        else
+          tmp = line.chomp.split(/\t/)
+          name = tmp[1]
+          gene = name.split(/:/)[1]
+          if v.include?(gene)
+            f.puts(line.chomp)
+          end
+        end
+      end
+      cnv.close
+      f.close
+    end
+  end
+end
+
+def find_highest_mean_across_samples(results)
+  out = 0.0
+  results.each do |k,v|
+    size = v.size
+    entry = []
+    v.each do |i,j|
+      tmp = j.split(";")[-2]
+      entry << tmp.to_f
+    end
+    avg = MyApp::mean(entry)
+    if avg > out
+      out = avg
+    end
+  end
+  return out
+end
+
+def clinical_path(batch, c_path=nil)
+  batch_num = batch_num_conversion(batch)
+  pre_path = "/mgl_mito/Clinical data"
+  if !c_path.nil?
+    pre_path = c_path
+  end 
+  
+  if !File.directory?("#{pre_path}/Batch#{batch_num}")
+    if File.directory?("#{pre_path}/00 Reported batches/Batch#{batch_num}") 
+      pre_path = "#{pre_path}/00 Reported batches"
+    else
+      pre_path = "#{pre_path}/00 Reported batches/*"
+    end
+  end
+  path = pre_path+"/Batch#{batch_num}"
+  Dir["#{path}/*"].each do |i|
+    if File.directory?(i)
+      if /-NGS-library-CNV/.match(i)
+        return i 
+      end
+    end
+  end
+  return "NOT FOUND"
+end
+
+def find_panels(path)
+  out = []
+  Dir["#{path}/*"].each do |i|
+    if File.directory?(i)
+      if /[\d]+-/.match(i)
+        out << File.basename(i)
+      end
+    end
+  end
+  return out
+end
+
+def find_exp_report(path)
+  out = []
+  file_string = "/*Expression*Report*.txt"
+  Dir["#{path}#{file_string}"].select do |e|
+    next if /DONOTUSE/.match(e)
+    next if /_CNV_data.txt/.match(e)
+    out << e
+  end
+  return out
+end
+
+def find_exp_report_in_path(path)
+  out = []
+  Dir["#{path}/*Expression*Report*.txt"].select do |e|
+    out << e
+  end
+  return out
+end
+
+def get_variance_from_same_sample(list)
+  input = []
+  list.each do |i,j|
+    input << j.split(";")[3].to_f 
+  end
+  return MyApp::standard_deviation(input)
+end
+
+def get_mean_value_from_same_sample(list)
+  input = []
+  list.each do |i,j|
+    input << j.split(";")[3].to_f
+  end
+  return MyApp::mean(input)
+end
+
+def normalize_correction(results)
+  results.each do |k,v|
+    mean = get_mean_value_from_same_sample(v)
+    tmp_sample = {}
+    v.each do |i,j|
+      tmp = j.split(";")
+      norm_all = tmp[3].to_f
+      if norm_all > 1.2 || norm_all < 0.8
+        norm_all = norm_all / mean
+      end
+      final_norm = norm_all * 2
+      result = tmp[0..2].join(";") + ";#{final_norm};#{tmp[3].to_f};#{tmp[4].to_f}"
+      tmp_sample[i] = result
+    end
+    results[k] = tmp_sample
+  end
+  return results
+end
+
+def find_additional_exp_file(batch, c_path, panel, exp_reps)
+  batch_current = batch - 1
+  path = clinical_path(batch_current, c_path)
+  batch_count = 1
+  while batch_count < 5 && File.directory?(path) && path != "NOT FOUND" do
+    if File.directory?("#{path}/#{panel}")
+      exp_reps = exp_reps + find_exp_report("#{path}/#{panel}")
+      batch_count = batch_count + 1
+    end
+    batch_current = batch_current - 1
+    path = clinical_path(batch_current, c_path)
+  end
+  if batch_count < 5
+    puts "only #{batch_count} batches found for #{panel}"
+  end
+  return exp_reps
+end
+
+def group_data_based_on_line_num(all_data)
+  nums = {}
+  all_data.each do |k,v|
+    tmp = []
+    index = v.size.to_s
+    if nums.key?(index)
+      tmp = nums[index]
+    end
+    tmp << k
+    nums[index] = tmp
+  end
+  return nums
+end
+
+def get_ref_std(all_data, list)
+  keys = []
+  data = {}
+  all_data.each do |k,v|
+      keys = v.keys    # get the column headers
+  end
+  if list.empty?
+    data = all_data
+  else
+    list.each do |k|
+      data[k] = all_data[k]
+    end
+  end
+  refs = {}
+  keys.each do |i|
+    avg = find_average(data, i)
+    std = find_std(data,i)
+    refs[i] = [avg, std]
+  end
+  return refs
+end
+
+def drs_filter(data, drs_thres)
+  check = []
+  keys = data.keys
+  size = (keys.size * drs_thres).ceil
+  for i in 0..size-1
+    check << keys[i]
+  end
+  data.each do |k,v|
+    next if check.include?(k)
+    index = 0
+    replace = FALSE
+    while index < size -1 && !replace
+      if data[check[index]] < v.to_f
+        check.delete_at(index)
+        check << k
+        replace = TRUE
+      end
+      index = index + 1
+    end
+  end
+  check.each do |k|
+    keys.delete(k)
+  end
+  return keys
+end
+
+def filter_data_for_ref(all_data,refs,cv_thres,drs_thres)
+  results = []
+  norm_all_arr = []
+  tmp_results = {} 
+  all_data.each do |k,v|
+    v.each do |i,j|
+      tmp_key = i.split(":")
+      index = tmp_key[0]
+      tmp = j.split(";")
+      norm_ind = tmp[1].to_f
+      ref_avg = refs[i][0].to_f
+      std = refs[i][1].to_f
+      norm_all = norm_ind / ref_avg
+      if norm_all.nan?
+        norm_all = 0
+      end
+      if std < cv_thres 
+        norm_all_arr << norm_all
+      end
+    end
+    drs = calculate_drs(norm_all_arr)
+    tmp_results[k] = drs
+  end
+  return drs_filter(tmp_results, drs_thres)
+end  
+
+def calculate_cnv(all_data, refs)
+  results = {}
+  norm_all_arr = []
+  all_data.each do |k,v|
+    tmp_sample = {}
+    v.each do |i,j|
+      tmp_key = i.split(":")
+      index = tmp_key[0]
+      tmp = j.split(";")
+      avg_read = tmp[0].to_f
+      norm_ind = tmp[1].to_f
+      ref_avg = refs[i][0].to_f
+      std = refs[i][1].to_f
+      norm_all = norm_ind / ref_avg
+      if norm_all.nan?
+        norm_all = 0
+      end
+      read_counts = tmp[2].to_f
+      tmp_sample[index] = "#{i};#{avg_read};#{norm_ind};#{norm_all};#{read_counts}"
+    end
+    results[k] = tmp_sample
+  end
+  return results
+end
+
+def calculate_drs(data)
+  num_arr = []
+  for i in 0..data.size-2
+    num = (data[i].to_f - data[i+1].to_f).abs
+    num_arr << num 
+  end
+  drs = MyApp::standard_deviation(num_arr)/Math.sqrt(2)
+end
+
+def read_check_file(file)
+  data = {}
+  if !File.exist?(file)
+    return data
+  end
+  f = File.open(file, "r")
+  while(line = f.gets)
+    tmp = line.chomp
+    panel = tmp.split(/\t/)[0]
+    genes = tmp.split(/\t/)[1]
+    gene_array = []
+    data[panel] = genes.split(",")
+  end
+  return data
+end
+
+
+options = {}
+optparse = OptionParser.new do |opts|
+  opts.banner = "Usage: ruby [full_path]\cnv_analysis.rb [options]"
+  opts.on('-b v', '--batch=v', "Batch number")  {|v| options[:batch] = v}
+  opts.on('-d v', '--dir=v', "directory of the files") {|v| options[:dir]=v}
+  opts.on('-f v', '--first=v', "first-check file") {|v| options[:first_file] = v}
+  opts.on('-p v', '--pan_file=v', "panel-check file") {|v| options[:panel_file] = v}
+end
+optparse.parse!
+
+if options[:batch].nil?
+  abort("need to specify the batch number, use -b [batch #]")
+elsif options[:batch]
+  if options[:first_file].nil?
+    options[:first_file] = "/mgl_mito/NGS configuration files/00-NGS library CDS configuration files/final_first-checkgenes.txt"
+  end
+  if options[:panel_file].nil?
+    options[:panel_file] = "/mgl_mito/NGS configuration files/00-NGS library CDS configuration files/panel-genelist.txt"
+  end
+  CV_THRESHOLD = 1
+  DRS_FILTER = 0.2
+  batch = options[:batch].to_i
+  puts "batch: #{batch}"
+  pre_path = clinical_path(batch, options[:dir])
+  if /NOT FOUND/.match(pre_path)
+    puts "The NGS-library-CNV folder is not found."
+    exit
+  end
+  no_configs = []
+  all_panels = find_panels(pre_path)
+  all_panels.each do |p|
+    puts "folder: #{p}"
+    panel_path = "#{pre_path}/#{p}"
+    exp_reps = find_exp_report(panel_path)
+    exp_reps = find_additional_exp_file(batch, options[:dir], p, exp_reps)
+    all_data = {}
+    exp_reps.each do |e|
+      all_data[e] = read_exp_file(e)     
+    end
+    group = group_data_based_on_line_num(all_data)
+    group.each do |count,f|
+      list = {} 
+      f.each do |item|
+        list[item] =  all_data[item]
+      end
+      refs = get_ref_std(list,[])
+      refs_list_filtered = filter_data_for_ref(list,refs,CV_THRESHOLD,DRS_FILTER)
+      puts "number of orig refs: #{f.size}"
+      puts "number of refs after filtering: #{refs_list_filtered.size}"
+      refs_filtered = get_ref_std(list,refs_list_filtered)
+      results = calculate_cnv(list, refs) #get cnv
+      final_results = normalize_correction(results)
+      create_ind_data(final_results, refs)
+      first_gene = read_check_file(options[:first_file])
+      out_check_files(panel_path,first_gene,"first")
+      panel_gene = read_check_file(options[:panel_file])
+      out_check_files(panel_path, panel_gene, "panel")
+      config = load_config_file(f[0])
+      coord_out = "#{panel_path}/CNV-Batch#{batch_num_conversion(batch)}-#{p}_line-#{count}_coords.txt"
+      out_cnv_coords_config(coord_out, final_results, config, f[0])
+      puts "coordinate file: #{coord_out}"
+      out_file = "#{panel_path}/CNV-Batch#{batch_num_conversion(batch)}-#{p}_line-#{count}-UCSC_track.txt"
+      panel = "Batch#{batch}-#{p}"
+      create_ucsc_custom_track(config, panel, final_results, out_file)
+      puts "UCSC track file: #{out_file}"
+      drs_out = "#{panel_path}/CNV-Batch#{batch_num_conversion(batch)}-#{p}_line-#{count}-DRS.txt"
+      out_drs_file(final_results, drs_out)
+      puts "DRS file: #{drs_out}"
+    end
+  end
+end
