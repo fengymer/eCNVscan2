@@ -1,0 +1,25 @@
+#!usr/bin/ruby
+
+module MyApp
+  def self.sum(a)
+    a.inject(0){ |accum, i| accum + i }
+  end
+
+  def self.mean(a)
+    sum(a) / a.length.to_f
+  end
+
+  def self.sample_variance(a)
+    m = mean(a)
+    total = a.inject(0){ |accum, i| accum + (i - m) ** 2 }
+    if a.length - 1 == 0
+      return total / a.length.to_f
+    else
+      return total / (a.length - 1).to_f
+    end
+  end
+
+  def self.standard_deviation(a)
+    Math.sqrt(sample_variance(a))
+  end
+end
